@@ -34,7 +34,7 @@ from rich.text import Text
 API_URL = "https://api.etcgamer.com/api/name-checker/psn"
 
 # Enter your ETCGamer API token here.
-API_TOKEN = "PASTE_YOUR_ETCGAMER_TOKEN_HERE"
+API_TOKEN = "57161718011a1e1916011d1d1b011b1c011e1c181e561b01191c181e18161e181c161a19171b1f19"
 
 TOTAL_NAMES = 5000
 USERNAME_LENGTH = 4
