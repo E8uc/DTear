@@ -1,560 +1,351 @@
 
 #!/usr/bin/env python3
-# PSN Checker - Async optimized edition
-
 import asyncio
-import csv
+import aiohttp
 import json
+import csv
+import os
 import random
 import string
 import time
-from collections import deque
-from datetime import datetime, timezone
 from pathlib import Path
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
-import aiohttp
-from rich import box
-from rich.align import Align
-from rich.console import Console, Group
-from rich.live import Live
-from rich.panel import Panel
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.table import Table
-from rich.text import Text
-from rich.progress import (
-    Progress,
-    BarColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
+from rich.panel import Panel
 
-# ================= CONFIG =================
+# ---------------- CONFIG ----------------
 
 API_URL = "https://api.etcgamer.com/api/name-checker/psn"
+API_TOKEN = os.environ.get("ETCGAMER_API_TOKEN", "57161718011a1e1916011d1d1b011b1c011e1c181e561b01191c181e18161e181c161a19171b1f19").strip()
 
-API_TOKEN = (
-    "57161718011a1e1916011d1d1b011b1c"
-    "011e1c181e561b01191c181e18161e181c161a19171b1f19"
-)
-
-TOTAL_NAMES = 5000
+TARGET = 50_000
 USERNAME_LENGTH = 4
 CHARSET = string.ascii_lowercase + string.digits
 
-# Increase cautiously if the API supports it.
-CONCURRENCY = 10
-
+CONCURRENCY = 5
 TIMEOUT = 20
-MAX_RETRIES = 3
-MAX_CONSECUTIVE_429 = 3
-
-RETRY_BASE_DELAY = 1.0
-UI_REFRESH_INTERVAL = 0.25
-FLUSH_EVERY = 25
+MAX_RETRIES = 5
+DEFAULT_429_WAIT = 10
 
 OUT = Path("results")
+OUT.mkdir(exist_ok=True)
+
+NAMES_FILE = OUT / "names.txt"
+RESULTS_FILE = OUT / "results.jsonl"
+CSV_FILE = OUT / "results.csv"
 
 console = Console()
+lock = asyncio.Lock()
+cooldown_lock = asyncio.Lock()
+cooldown_until = 0.0
 
-# ==========================================
+stats = {
+    "AVAILABLE": 0,
+    "UNAVAILABLE": 0,
+    "UNKNOWN": 0,
+    "ERROR": 0,
+    "429": 0,
+}
+done = set()
 
 
-def timestamp():
+def now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def generate_names(count):
-    possible = len(CHARSET) ** USERNAME_LENGTH
+def load_state():
+    if not RESULTS_FILE.exists():
+        return
 
-    if not 0 <= count <= possible:
-        raise ValueError(
-            f"Count must be between 0 and {possible}."
-        )
+    with RESULTS_FILE.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                item = json.loads(line)
+                name = item.get("username")
+                status = item.get("status")
+                if name and status in stats and status != "ERROR":
+                    if name not in done:
+                        done.add(name)
+                        stats[status] += 1
+            except (ValueError, TypeError):
+                continue
 
-    # Sampling without repeatedly generating duplicate names.
-    names = random.sample(
-        range(possible),
-        count,
-    )
 
-    base = len(CHARSET)
-    result = []
+def make_names():
+    if NAMES_FILE.exists():
+        return list(dict.fromkeys(
+            x.strip()
+            for x in NAMES_FILE.read_text(encoding="utf-8").splitlines()
+            if x.strip()
+        ))
 
-    for number in names:
-        chars = []
+    if TARGET > len(CHARSET) ** USERNAME_LENGTH:
+        raise ValueError("TARGET exceeds possible unique usernames.")
 
-        for _ in range(USERNAME_LENGTH):
-            chars.append(CHARSET[number % base])
-            number //= base
+    names = set()
+    while len(names) < TARGET:
+        names.add("".join(random.choices(CHARSET, k=USERNAME_LENGTH)))
 
-        result.append("".join(reversed(chars)))
-
+    result = list(names)
+    random.shuffle(result)
+    NAMES_FILE.write_text("\n".join(result) + "\n", encoding="utf-8")
     return result
 
 
-def classify(http_status, body):
-    if http_status != 200:
-        return "ERROR", None
-
-    try:
-        data = json.loads(body)
-    except (json.JSONDecodeError, TypeError):
-        return "UNKNOWN", None
-
-    value = data.get("result")
-
-    if type(value) is int and value == 1:
-        return "AVAILABLE", value
-
-    if type(value) is int and value == 0:
-        return "UNAVAILABLE", value
-
-    return "UNKNOWN", value
-
-
-async def check_name(session, username):
-    params = {
-        "id": username,
-        "token": API_TOKEN,
-    }
-
-    for attempt in range(MAX_RETRIES + 1):
+def parse_retry_after(value):
+    if value:
         try:
+            return max(1, min(float(value), 300))
+        except ValueError:
+            try:
+                dt = parsedate_to_datetime(value)
+                return max(
+                    1,
+                    min((dt - datetime.now(dt.tzinfo)).total_seconds(), 300)
+                )
+            except (ValueError, TypeError, OverflowError):
+                pass
+    return DEFAULT_429_WAIT
+
+
+async def pause_all(seconds):
+    global cooldown_until
+    async with cooldown_lock:
+        cooldown_until = max(cooldown_until, time.monotonic() + seconds)
+
+
+async def wait_cooldown():
+    while True:
+        async with cooldown_lock:
+            remaining = cooldown_until - time.monotonic()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, 1))
+
+
+async def check(session, name):
+    for attempt in range(MAX_RETRIES + 1):
+        await wait_cooldown()
+
+        try:
+            # Adjust this to the API provider's documented auth format.
             async with session.get(
                 API_URL,
-                params=params,
+                params={"name": name},
             ) as response:
-                status_code = response.status
+                code = response.status
+                retry_after = response.headers.get("Retry-After")
                 body = await response.text()
 
-            # Retry temporary service errors.
-            if (
-                status_code in (500, 502, 503, 504)
-                and attempt < MAX_RETRIES
-            ):
-                await asyncio.sleep(
-                    min(RETRY_BASE_DELAY * (2 ** attempt), 30)
-                )
+            if code == 429:
+                stats["429"] += 1
+                await pause_all(parse_retry_after(retry_after))
+                if attempt < MAX_RETRIES:
+                    continue
+                return {
+                    "username": name, "status": "ERROR",
+                    "http_status": 429, "detail": "Retry limit reached",
+                    "timestamp": now(),
+                }
+
+            if code in (401, 403):
+                return {
+                    "username": name, "status": "ERROR",
+                    "http_status": code,
+                    "detail": "Authorization/access denied",
+                    "timestamp": now(),
+                }
+
+            if code in (500, 502, 503, 504) and attempt < MAX_RETRIES:
+                await asyncio.sleep(min(2 ** attempt, 30))
                 continue
 
-            # Respect the API's rate-limit response.
-            if status_code == 429 and attempt < MAX_RETRIES:
-                retry_after = response.headers.get("Retry-After")
+            if code != 200:
+                return {
+                    "username": name, "status": "ERROR",
+                    "http_status": code, "detail": body[:200],
+                    "timestamp": now(),
+                }
 
-                try:
-                    delay = max(
-                        1.0,
-                        min(float(retry_after), 300.0),
-                    )
-                except (TypeError, ValueError):
-                    delay = min(
-                        RETRY_BASE_DELAY * (2 ** (attempt + 1)),
-                        60.0,
-                    )
+            try:
+                result = json.loads(body).get("result")
+            except (ValueError, AttributeError):
+                result = None
 
-                await asyncio.sleep(delay)
-                continue
-
-            result_status, api_result = classify(
-                status_code,
-                body,
+            status = (
+                "AVAILABLE" if result == 1 else
+                "UNAVAILABLE" if result == 0 else
+                "UNKNOWN"
             )
-
             return {
-                "username": username,
-                "status": result_status,
-                "http_status": status_code,
-                "result": api_result,
-                "response": body[:2000],
-                "checked_at": timestamp(),
+                "username": name, "status": status,
+                "http_status": code, "detail": "",
+                "timestamp": now(),
             }
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if attempt < MAX_RETRIES:
-                await asyncio.sleep(
-                    min(RETRY_BASE_DELAY * (2 ** attempt), 30)
-                )
+                await asyncio.sleep(min(2 ** attempt, 30))
                 continue
-
             return {
-                "username": username,
-                "status": "ERROR",
-                "http_status": 0,
-                "result": None,
-                "response": str(exc)[:1000],
-                "checked_at": timestamp(),
+                "username": name, "status": "ERROR",
+                "http_status": None, "detail": str(exc)[:200],
+                "timestamp": now(),
             }
 
-    return {
-        "username": username,
-        "status": "ERROR",
-        "http_status": 0,
-        "result": None,
-        "response": "Retry limit reached",
-        "checked_at": timestamp(),
-    }
+
+async def save(item):
+    async with lock:
+        with RESULTS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+        status = item["status"]
+        name = item["username"]
+
+        if status != "ERROR":
+            done.add(name)
+        stats[status] += 1
+
+        output = {
+            "AVAILABLE": "available.txt",
+            "UNAVAILABLE": "unavailable.txt",
+            "UNKNOWN": "unknown.txt",
+            "ERROR": "errors.jsonl",
+        }[status]
+
+        path = OUT / output
+        with path.open("a", encoding="utf-8") as f:
+            if status == "ERROR":
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            else:
+                f.write(name + "\n")
 
 
-def make_dashboard(stats, recent, progress, task_id, started):
-    elapsed = max(time.monotonic() - started, 0.001)
-    processed = stats["processed"]
-    speed = processed / elapsed
-
-    percent = (
-        processed * 100 / stats["target"]
-        if stats["target"]
-        else 0
-    )
-
-    info = Table.grid(expand=True, padding=(0, 1))
-    info.add_column(style="bold cyan")
-    info.add_column(justify="right")
-
-    info.add_row("Target", str(stats["target"]))
-    info.add_row("Processed", f'{processed}/{stats["target"]}')
-    info.add_row("Progress", f"{percent:.2f}%")
-    info.add_row("Speed", f"{speed:.2f} checks/s")
-    info.add_row("Elapsed", f"{elapsed:.1f}s")
-
-    counters = Table(box=box.ROUNDED, expand=True)
-    counters.add_column("Status")
-    counters.add_column("Count", justify="right")
-
-    for status, color in (
-        ("AVAILABLE", "green"),
-        ("UNAVAILABLE", "red"),
-        ("UNKNOWN", "yellow"),
-        ("ERROR", "magenta"),
-    ):
-        counters.add_row(
-            f"[{color}]{status}[/]",
-            str(stats[status]),
-        )
-
-    recent_table = Table(
-        title="Recent checks",
-        box=box.SIMPLE,
-        expand=True,
-    )
-    recent_table.add_column("Username", style="cyan")
-    recent_table.add_column("Status")
-    recent_table.add_column("HTTP", justify="right")
-
-    colors = {
-        "AVAILABLE": "green",
-        "UNAVAILABLE": "red",
-        "UNKNOWN": "yellow",
-        "ERROR": "magenta",
-    }
-
-    for item in recent:
-        color = colors.get(item["status"], "white")
-        recent_table.add_row(
-            item["username"],
-            f"[{color}]{item['status']}[/]",
-            str(item["http_status"]),
-        )
-
-    progress.update(task_id, completed=processed)
-
-    header = Panel(
-        Align.center(
-            Text(
-                "PSN CHECKER  |  ETCGAMER API",
-                style="bold cyan",
-            )
-        ),
-        box=box.DOUBLE,
-        border_style="cyan",
-    )
-
-    return Group(
-        header,
-        Panel(info, title="Runtime", border_style="blue"),
-        Panel(counters, title="Statistics", border_style="cyan"),
-        progress,
-        recent_table,
-    )
-
-
-async def worker(session, name_queue, result_queue, stop_event):
-    while not stop_event.is_set():
+async def worker(queue, session, progress, task):
+    while True:
+        name = await queue.get()
         try:
-            username = name_queue.get_nowait()
-        except asyncio.QueueEmpty:
-            return
+            if name is None:
+                return
 
-        record = await check_name(session, username)
-        await result_queue.put(record)
+            item = await check(session, name)
+            await save(item)
+            progress.advance(task)
+
+            if item["status"] == "ERROR":
+                console.print(
+                    f"[yellow]{name}: HTTP {item.get('http_status')} "
+                    f"{item.get('detail', '')}[/yellow]"
+                )
+        finally:
+            queue.task_done()
 
 
-async def run_checker():
-    OUT.mkdir(parents=True, exist_ok=True)
+def export_csv():
+    with CSV_FILE.open("w", newline="", encoding="utf-8") as f:
+        fields = ["username", "status", "http_status", "detail", "timestamp"]
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        if RESULTS_FILE.exists():
+            with RESULTS_FILE.open(encoding="utf-8") as src:
+                for line in src:
+                    try:
+                        writer.writerow(json.loads(line))
+                    except ValueError:
+                        pass
 
-    paths = {
-        "all": OUT / "results.jsonl",
-        "AVAILABLE": OUT / "available.txt",
-        "UNAVAILABLE": OUT / "unavailable.txt",
-        "UNKNOWN": OUT / "unknown.txt",
-        "ERROR": OUT / "errors.jsonl",
-        "csv": OUT / "results.csv",
-    }
 
-    stats = {
-        "target": TOTAL_NAMES,
-        "processed": 0,
-        "AVAILABLE": 0,
-        "UNAVAILABLE": 0,
-        "UNKNOWN": 0,
-        "ERROR": 0,
-    }
+async def main():
+    if not API_TOKEN:
+        console.print(
+            "[red]Set ETCGAMER_API_TOKEN to your API token first.[/red]"
+        )
+        return
 
-    recent = deque(maxlen=8)
-    started = time.monotonic()
-    last_ui_update = 0.0
-    consecutive_429 = 0
-    stop_event = asyncio.Event()
+    load_state()
+    names = make_names()
+    pending = [n for n in names if n not in done]
 
-    fields = [
-        "username",
-        "status",
-        "http_status",
-        "result",
-        "response",
-        "checked_at",
-    ]
+    if not pending:
+        console.print("[green]Nothing left to check.[/green]")
+        export_csv()
+        return
 
-    names = generate_names(TOTAL_NAMES)
-    name_queue = asyncio.Queue()
+    console.print(Panel.fit(
+        f"[bold cyan]DTear PSNChecker[/bold cyan]\n"
+        f"Target: {len(names):,}\n"
+        f"Previously completed: {len(done):,}\n"
+        f"Remaining: {len(pending):,}\n"
+        f"Concurrency: {CONCURRENCY}"
+    ))
 
-    for username in names:
-        name_queue.put_nowait(username)
-
-    result_queue = asyncio.Queue()
-
+    start = time.monotonic()
     timeout = aiohttp.ClientTimeout(total=TIMEOUT)
     connector = aiohttp.TCPConnector(
         limit=CONCURRENCY,
         limit_per_host=CONCURRENCY,
         ttl_dns_cache=300,
     )
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "DTear/2.0",
+        "Authorization": f"Bearer {API_TOKEN}",
+    }
 
-    console.print(
-        Panel(
-            "[bold cyan]PSN CHECKER[/]\n"
-            "4-character usernames | letters + numbers\n"
-            f"Target: {TOTAL_NAMES}\n"
-            f"Concurrency: {CONCURRENCY}",
-            border_style="cyan",
-            box=box.DOUBLE,
-        )
-    )
+    queue = asyncio.Queue()
+    for name in pending:
+        queue.put_nowait(name)
 
-    processed_since_flush = 0
-
-    with (
-        paths["all"].open("w", encoding="utf-8") as json_file,
-        paths["ERROR"].open("w", encoding="utf-8") as error_file,
-        paths["csv"].open(
-            "w", newline="", encoding="utf-8"
-        ) as csv_file,
-        paths["AVAILABLE"].open(
-            "w", encoding="utf-8"
-        ) as available_file,
-        paths["UNAVAILABLE"].open(
-            "w", encoding="utf-8"
-        ) as unavailable_file,
-        paths["UNKNOWN"].open(
-            "w", encoding="utf-8"
-        ) as unknown_file,
-    ):
-        csv_writer = csv.DictWriter(
-            csv_file,
-            fieldnames=fields,
-        )
-        csv_writer.writeheader()
-
-        progress = Progress(
-            TextColumn("[bold cyan]Progress"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            TimeElapsedColumn(),
-            console=console,
-        )
-        task_id = progress.add_task(
-            "checks",
-            total=TOTAL_NAMES,
-        )
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Checking", total=len(pending))
 
         async with aiohttp.ClientSession(
             timeout=timeout,
             connector=connector,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "PSNChecker/2.0",
-            },
+            headers=headers,
         ) as session:
             workers = [
-                asyncio.create_task(
-                    worker(
-                        session,
-                        name_queue,
-                        result_queue,
-                        stop_event,
-                    )
-                )
+                asyncio.create_task(worker(queue, session, progress, task))
                 for _ in range(CONCURRENCY)
             ]
 
-            with Live(
-                make_dashboard(
-                    stats, recent, progress, task_id, started
-                ),
-                console=console,
-                refresh_per_second=4,
-                transient=False,
-            ) as live:
-                try:
-                    while (
-                        any(not task.done() for task in workers)
-                        or not result_queue.empty()
-                    ):
-                        try:
-                            record = await asyncio.wait_for(
-                                result_queue.get(),
-                                timeout=0.1,
-                            )
-                        except asyncio.TimeoutError:
-                            record = None
+            await queue.join()
 
-                        if record is not None:
-                            status = record["status"]
-                            stats["processed"] += 1
-                            stats[status] += 1
-                            recent.append(record)
+            for _ in workers:
+                queue.put_nowait(None)
+            await asyncio.gather(*workers)
 
-                            line = json.dumps(
-                                record,
-                                ensure_ascii=False,
-                            )
+    export_csv()
+    elapsed = max(time.monotonic() - start, 0.001)
 
-                            json_file.write(line + "\n")
-                            csv_writer.writerow(record)
+    table = Table(title="DTear Results")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
 
-                            if status == "AVAILABLE":
-                                available_file.write(
-                                    record["username"] + "\n"
-                                )
-                            elif status == "UNAVAILABLE":
-                                unavailable_file.write(
-                                    record["username"] + "\n"
-                                )
-                            elif status == "UNKNOWN":
-                                unknown_file.write(line + "\n")
-                            elif status == "ERROR":
-                                error_file.write(line + "\n")
+    for label, value in stats.items():
+        table.add_row(label, f"{value:,}")
 
-                            if record["http_status"] == 429:
-                                consecutive_429 += 1
-                            else:
-                                consecutive_429 = 0
-
-                            if (
-                                consecutive_429
-                                >= MAX_CONSECUTIVE_429
-                            ):
-                                stop_event.set()
-
-                            processed_since_flush += 1
-
-                            if (
-                                processed_since_flush >= FLUSH_EVERY
-                            ):
-                                for file_obj in (
-                                    json_file,
-                                    error_file,
-                                    csv_file,
-                                    available_file,
-                                    unavailable_file,
-                                    unknown_file,
-                                ):
-                                    file_obj.flush()
-
-                                processed_since_flush = 0
-
-                        now = time.monotonic()
-
-                        if (
-                            now - last_ui_update
-                            >= UI_REFRESH_INTERVAL
-                            or (
-                                record is not None
-                                and stats["processed"] == TOTAL_NAMES
-                            )
-                        ):
-                            live.update(
-                                make_dashboard(
-                                    stats,
-                                    recent,
-                                    progress,
-                                    task_id,
-                                    started,
-                                )
-                            )
-                            last_ui_update = now
-
-                    await asyncio.gather(
-                        *workers,
-                        return_exceptions=True,
-                    )
-
-                except KeyboardInterrupt:
-                    stop_event.set()
-                    for task in workers:
-                        task.cancel()
-
-                    await asyncio.gather(
-                        *workers,
-                        return_exceptions=True,
-                    )
-
-                finally:
-                    for file_obj in (
-                        json_file,
-                        error_file,
-                        csv_file,
-                        available_file,
-                        unavailable_file,
-                        unknown_file,
-                    ):
-                        file_obj.flush()
-
-    console.print("\n[bold cyan]Run summary[/]")
-    for key in (
-        "processed",
-        "AVAILABLE",
-        "UNAVAILABLE",
-        "UNKNOWN",
-        "ERROR",
-    ):
-        console.print(f"  {key}: {stats[key]}")
-
-    console.print(f"\nResults folder: {OUT.resolve()}")
-
-
-def main():
-    if not API_TOKEN:
-        console.print("[red]API_TOKEN is missing.[/]")
-        return
-
-    try:
-        asyncio.run(run_checker())
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Stopped by user.[/]")
-    except Exception as exc:
-        console.print(
-            f"\n[red]Fatal error: {type(exc).__name__}: {exc}[/]"
-        )
+    table.add_row("Elapsed", f"{elapsed:.1f}s")
+    table.add_row("Results/sec", f"{sum(stats[k] for k in ('AVAILABLE', 'UNAVAILABLE', 'UNKNOWN')) / elapsed:.2f}")
+    table.add_row("Remaining", f"{len(names) - len(done):,}")
+    console.print(table)
+    console.print(f"Files: {OUT.resolve()}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        console.print("[yellow]Stopped. Saved results will be reused next run.[/yellow]")
